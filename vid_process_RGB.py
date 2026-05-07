@@ -1,0 +1,189 @@
+import cv2
+import numpy as np
+import os
+import argparse
+from pathlib import Path
+
+parser = argparse.ArgumentParser(description="영상의 각 프레임과 첫 N 프레임 평균 간 밝기 차이 영상 생성 (컬러, 가우시안 필터 적용)")
+parser.add_argument("--input", "-i", type=str, default=None, help="입력 동영상 경로 (.mp4)")
+parser.add_argument("--output", "-o", type=str, default=None, help="출력 동영상 경로 (.mp4)")
+args = parser.parse_args()
+
+# --- 크롭 설정 (사용자가 여기서 직접 수정, 0.0 ~ 1.0 사이 값) ---
+# 예: 0.1 = 10%
+CROP_PERCENT_TOP = 0.0    # 위쪽에서 제거할 비율
+CROP_PERCENT_BOTTOM = 0.0 # 아래쪽에서 제거할 비율
+CROP_PERCENT_LEFT = 0.0   # 왼쪽에서 제거할 비율
+CROP_PERCENT_RIGHT = 0.1  # 오른쪽에서 제거할 비율
+# -----------------------------------------------------------------
+
+# --- 크롭 인자 유효성 검사 (퍼센트 기반) ---
+crop_percents = [CROP_PERCENT_TOP, CROP_PERCENT_BOTTOM, CROP_PERCENT_LEFT, CROP_PERCENT_RIGHT]
+is_cropping = any(p > 0.0 for p in crop_percents)
+
+if not all(0.0 <= p < 1.0 for p in crop_percents):
+    raise ValueError("크롭 비율은 0.0 이상 1.0 미만이어야 합니다.")
+
+if (CROP_PERCENT_TOP + CROP_PERCENT_BOTTOM) >= 1.0 or \
+   (CROP_PERCENT_LEFT + CROP_PERCENT_RIGHT) >= 1.0:
+    raise ValueError("상하 또는 좌우 크롭 비율의 합이 1.0 (100%) 이상일 수 없습니다.")
+# -----------------------------------------------
+
+project_root = Path(__file__).resolve().parent
+
+# 기본 입력 동영상 (사용자 지정 경로)
+base_dir = Path(r"C:\Users\hq\OneDrive - 대전동신과학고등학교\KAIST_BS\2025\2025 URP\VBTS 제작\20251202_Force_Estimation\dataset1_hexagon")
+default_input_path = base_dir / f"rnd1.mp4"
+
+input_path = Path(args.input) if args.input else default_input_path
+
+if not input_path.exists():
+    raise FileNotFoundError(f"입력 동영상이 존재하지 않습니다: {input_path}")
+
+# 출력 경로 설정...
+if args.output:
+    output_video_path = Path(args.output)
+else:
+    default_output_dir = base_dir
+    output_video_path = default_output_dir / f"{input_path.stem}_color_diff.mp4" # 파일명 변경
+
+output_video_path.parent.mkdir(parents=True, exist_ok=True)
+
+# 동영상 캡처 객체 생성
+cap = cv2.VideoCapture(str(input_path))
+
+if not cap.isOpened():
+    raise IOError(f"Cannot open video file: {input_path}")
+
+# 동영상 정보 먼저 얻기
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+fps = cap.get(cv2.CAP_PROP_FPS)
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+
+# --- 출력 비디오 크기 결정 (퍼센트 기반) ---
+if is_cropping:
+    # 픽셀 좌표 계산
+    crop_y1 = int(frame_height * CROP_PERCENT_TOP)
+    crop_y2 = int(frame_height * (1.0 - CROP_PERCENT_BOTTOM))
+    crop_x1 = int(frame_width * CROP_PERCENT_LEFT)
+    crop_x2 = int(frame_width * (1.0 - CROP_PERCENT_RIGHT))
+
+    # 새 출력 크기
+    out_width = crop_x2 - crop_x1
+    out_height = crop_y2 - crop_y1
+
+    # 유효성 검사 (계산된 크기가 0보다 큰지)
+    if out_width <= 0 or out_height <= 0:
+        raise ValueError(
+            f"크롭 비율이 너무 커서 유효한 프레임 영역이 없습니다. "
+            f"(계산된 크기: {out_width}x{out_height})"
+        )
+    
+    print(f"Original size: {frame_width}x{frame_height}. Cropping to {out_width}x{out_height}.")
+    print(f"  (Top: {CROP_PERCENT_TOP*100:.1f}%, Bottom: {CROP_PERCENT_BOTTOM*100:.1f}%, "
+          f"Left: {CROP_PERCENT_LEFT*100:.1f}%, Right: {CROP_PERCENT_RIGHT*100:.1f}%)")
+    print(f"  Pixel slice: [y:{crop_y1}:{crop_y2}, x:{crop_x1}:{crop_x2}]")
+else:
+    out_width = frame_width
+    out_height = frame_height
+    print(f"Original size: {frame_width}x{frame_height}. No crop specified.")
+# ---------------------------------------------
+
+
+print(f"Calculating average of first N frames for reference...")
+
+# (평균 프레임 계산 로직은 동일)
+accumulator = np.zeros((frame_height, frame_width, 3), dtype=np.float64)
+frame_count = 0
+num_frames_to_average = 5
+
+for i in range(num_frames_to_average):
+    ret, frame = cap.read()
+    if not ret:
+        print(f"Warning: Video ended before reaching {num_frames_to_average} frames. Averaging {frame_count} frames.")
+        break 
+    accumulator += frame.astype(np.float64)
+    frame_count += 1
+
+if frame_count == 0:
+    raise IOError("Cannot read any frames from the video.")
+
+average_frame_float = accumulator / frame_count
+reference_img = np.clip(average_frame_float, 0, 255).astype(np.uint8)
+reference_gray = cv2.cvtColor(reference_img, cv2.COLOR_BGR2GRAY)
+
+# --- 가우시안 필터 설정 ---
+# <<< 여기서 필터 강도를 조절하세요 (숫자는 홀수여야 함) >>>
+GAUSSIAN_KERNEL_SIZE = (5, 5) 
+sigma_x = 0 
+
+# 기준 프레임에 가우시안 필터 적용
+reference_gray = cv2.GaussianBlur(reference_gray, GAUSSIAN_KERNEL_SIZE, sigma_x)
+
+print("Reference frame calculation complete.")
+
+cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+# --- VideoWriter 초기화 (컬러 영상으로 저장) ---
+out = cv2.VideoWriter(str(output_video_path), fourcc, fps, (out_width, out_height), isColor=True)
+
+print(f"Processing video and saving to: {output_video_path}")
+
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    frame_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # --- 가우시안 필터 적용 ---
+    # 현재 프레임에 가우시안 필터 적용
+    frame_gray_filtered = cv2.GaussianBlur(frame_gray, GAUSSIAN_KERNEL_SIZE, sigma_x)
+
+    # 필터링된 이미지를 기반으로 차이 계산
+    frame_s = frame_gray_filtered.astype(np.int16) 
+    reference_s = reference_gray.astype(np.int16) 
+    signed_diff = frame_s - reference_s
+    
+    # --- 컬러 채널 분리 로직 (RED/GREEN 개별 대비 설정) ---
+    
+    # <<< 여기서 값을 조절하세요 >>>
+    GREEN_CONTRAST_FACTOR = 20.0 # 밝아진 부분 (초록색) 대비
+    RED_CONTRAST_FACTOR = 10.0   # 어두워진 부분 (빨간색) 대비
+    
+    # 1. 어두워진 부분 추출 (Red 채널)
+    negative_diffs = np.maximum(0, signed_diff * -1)
+    red_amplified = np.multiply(negative_diffs, RED_CONTRAST_FACTOR)
+    red_channel = np.clip(red_amplified, 0, 255).astype(np.uint8)
+
+    # 2. 밝아진 부분 추출 (Green 채널)
+    positive_diffs = np.maximum(0, signed_diff)
+    green_amplified = np.multiply(positive_diffs, GREEN_CONTRAST_FACTOR)
+    green_channel = np.clip(green_amplified, 0, 255).astype(np.uint8)
+    
+    # 3. 기준 프레임의 밝기를 Blue 채널에 할당 (수정된 부분)
+    # reference_gray는 이미 위에서 가우시안 필터까지 적용된 상태입니다.
+    blue_channel = reference_gray.copy() 
+    
+    # 채널 병합 (B, G, R 순서)
+    color_diff_frame = cv2.merge([blue_channel, green_channel, red_channel])
+    
+    brightness_diff = color_diff_frame
+
+
+    # --- 크롭 적용 --- (퍼센트 기반으로 계산된 좌표 사용)
+    if is_cropping:
+        # 이전에 계산된 crop_y1, crop_y2, crop_x1, crop_x2 사용
+        final_frame = brightness_diff[crop_y1:crop_y2, crop_x1:crop_x2]
+    else:
+        final_frame = brightness_diff
+
+    # final_frame 저장
+    out.write(final_frame)
+
+# 자원 해제
+cap.release()
+out.release()
+
+print("Processing complete.")

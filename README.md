@@ -76,9 +76,15 @@ python resolution_study.py --part 2
 python resolution_study.py --merge
 ```
 
-**출력:**
-- 해상도별 R², RMSE, MAE 비교 그래프
-- 해상도별 Parity plots 및 Loss curves
+**해상도별 출력 (force_estimation_1632x1080.py와 동일):**
+- Detailed metrics CSV (RMSE, MAE, Bias, R², Slope, Intercept)
+- Parity plots (Standard Test / Object-Based Test)
+- Time-series analysis (10 random trials - 시계열 플롯 + CSV)
+- Loss history, 모델 파일, execution_time.csv
+
+**비교 그래프 (--merge):**
+- 해상도별 R², RMSE 비교 그래프
+- Loss curves 비교
 - 해상도-성능-학습시간 종합 Summary
 
 ## Requirements

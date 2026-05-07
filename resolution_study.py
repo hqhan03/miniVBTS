@@ -150,7 +150,11 @@ def evaluate_model(model, loader, scaler):
         error = y_pred[:, i] - y_true[:, i]
         metrics[f'{col}_RMSE'] = float(np.sqrt(np.mean(error ** 2)))
         metrics[f'{col}_MAE'] = float(np.mean(np.abs(error)))
+        metrics[f'{col}_Bias'] = float(np.mean(error))
         metrics[f'{col}_R2'] = float(r2_score(y_true[:, i], y_pred[:, i]))
+        slope, intercept = np.polyfit(y_true[:, i], y_pred[:, i], 1)
+        metrics[f'{col}_Slope'] = float(slope)
+        metrics[f'{col}_Intercept'] = float(intercept)
     return metrics, y_true, y_pred
 
 
@@ -179,9 +183,81 @@ def save_parity_plots(y_true, y_pred, save_path, title_prefix):
     plt.close()
 
 
+# --- Detailed Metrics CSV 저장 ---
+def save_detailed_metrics(metrics, save_path):
+    rows = []
+    for col in LABEL_COLUMNS:
+        rows.append({
+            'Axis': col,
+            'RMSE': metrics[f'{col}_RMSE'],
+            'MAE': metrics[f'{col}_MAE'],
+            'Bias': metrics[f'{col}_Bias'],
+            'R2': metrics[f'{col}_R2'],
+            'Slope': metrics[f'{col}_Slope'],
+            'Intercept': metrics[f'{col}_Intercept'],
+        })
+    pd.DataFrame(rows).to_csv(save_path, index=False)
+
+
+# --- 시계열 분석 및 저장 ---
+def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_trials=10):
+    print(f"  [Time-series] {num_trials}개 샘플 추출 중...")
+    model.eval()
+    ts_dir.mkdir(exist_ok=True)
+
+    test_indices = [i for i, obj_id in enumerate(dataset.sample_obj_ids) if obj_id in obj_test_ids]
+    test_pairs = sorted(list(set(
+        [(dataset.sample_obj_ids[i], dataset.sample_trial_ids[i]) for i in test_indices]
+    )))
+    selected_pairs = random.sample(test_pairs, min(num_trials, len(test_pairs)))
+
+    for obj_id, trial_id in selected_pairs:
+        indices = [i for i, (o, t) in enumerate(zip(dataset.sample_obj_ids, dataset.sample_trial_ids))
+                   if o == obj_id and t == trial_id]
+
+        trial_preds, trial_labels = [], []
+        trial_loader = DataLoader(Subset(dataset, indices), batch_size=BATCH_SIZE, shuffle=False)
+        with torch.no_grad():
+            for imgs, labels in trial_loader:
+                imgs = imgs.to(DEVICE)
+                with torch.amp.autocast(DEVICE.type):
+                    preds = model(imgs)
+                trial_preds.append(preds.cpu().numpy())
+                trial_labels.append(labels.numpy())
+
+        y_pred = scaler.inverse_transform(np.vstack(trial_preds))
+        y_true = scaler.inverse_transform(np.vstack(trial_labels))
+
+        # CSV 저장
+        df_res = pd.DataFrame()
+        df_res['Frame'] = range(len(y_true))
+        for i, col in enumerate(LABEL_COLUMNS):
+            df_res[f'True_{col}'] = y_true[:, i]
+            df_res[f'Pred_{col}'] = y_pred[:, i]
+        df_res.to_csv(ts_dir / f"Time-series_Obj{obj_id:02d}_Trial{trial_id}.csv", index=False)
+
+        # Plot
+        fig, axes = plt.subplots(3, 2, figsize=(16, 12))
+        fig.suptitle(f"Object {obj_id:02d} - Trial {trial_id}", fontsize=18)
+        axes = axes.flatten()
+        for i, col in enumerate(LABEL_COLUMNS):
+            axes[i].plot(df_res['Frame'], df_res[f'True_{col}'], label='Ground Truth', color='black', alpha=0.6)
+            axes[i].plot(df_res['Frame'], df_res[f'Pred_{col}'], label='Predicted', color='red', linestyle='--')
+            axes[i].set_title(f"{col} Estimation", fontsize=14)
+            axes[i].set_xlabel("Frame Index")
+            axes[i].set_ylabel("Value")
+            axes[i].legend()
+            axes[i].grid(True, alpha=0.3)
+        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.savefig(ts_dir / f"Plot_Obj{obj_id:02d}_Trial{trial_id}.png", dpi=200)
+        plt.close()
+
+    print(f"  [Time-series] 완료: {ts_dir}")
+
+
 # --- 단일 해상도 학습 ---
 def train_one_resolution(width, height, full_dataset, train_idx, val_idx,
-                         std_test_idx, obj_test_indices, scaler):
+                         std_test_idx, obj_test_indices, obj_test_ids, scaler):
     label = f"{width}x{height}"
     res_dir = SAVE_DIR / label
     res_dir.mkdir(exist_ok=True)
@@ -260,6 +336,14 @@ def train_one_resolution(width, height, full_dataset, train_idx, val_idx,
                       f"{label} - Standard Test")
     save_parity_plots(obj_true, obj_pred, res_dir / "parity_object_test.png",
                       f"{label} - Object-Based Test")
+
+    # Detailed metrics CSV (Bias, Slope, Intercept 포함)
+    save_detailed_metrics(std_metrics, res_dir / "Standard_Test_metrics.csv")
+    save_detailed_metrics(obj_metrics, res_dir / "Object_Based_Test_metrics.csv")
+
+    # 시계열 분석 (10 random trials)
+    save_timeseries_analysis(model, full_dataset, obj_test_ids, scaler,
+                             ts_dir=res_dir / "timeseries_results")
 
     # 모델 저장
     torch.save(model.state_dict(), res_dir / "model.pth")
@@ -485,9 +569,17 @@ def main():
 
         res_start = time.time()
         std_m, obj_m = train_one_resolution(
-            w, h, full_dataset, train_idx, val_idx, std_test_idx, obj_test_indices, scaler
+            w, h, full_dataset, train_idx, val_idx, std_test_idx, obj_test_indices, obj_test_ids, scaler
         )
         elapsed = time.time() - res_start
+
+        # execution_time.csv 저장
+        h_e, rem = divmod(int(elapsed), 3600)
+        m_e, s_e = divmod(rem, 60)
+        pd.DataFrame([{
+            "Total_Elapsed_Seconds": round(elapsed, 1),
+            "Total_Elapsed": f"{h_e}h {m_e}m {s_e}s",
+        }]).to_csv(SAVE_DIR / label / "execution_time.csv", index=False)
 
         entry = {
             'resolution': label,

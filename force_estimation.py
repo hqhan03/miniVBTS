@@ -18,7 +18,8 @@ import seaborn as sns
 from tqdm import tqdm
 
 # --- 1. 하드웨어 및 경로 설정 ---
-DATA_DIR = Path(r"C:\Users\hq\Documents\20251202_Force_Estimation\data")
+DATA_DIR = Path(r"C:\Users\hq\Downloads\20251202_Force_Estimation\20251224_miniVBTS_force_estimation_data")
+CSV_DIR = DATA_DIR / "FTsensor_data"
 SAVE_DIR = Path(r"./research_results")
 PLOT_DIR = SAVE_DIR / "plots"
 TS_DIR = SAVE_DIR / "timeseries_results" # 시계열 결과 저장 폴더
@@ -64,9 +65,10 @@ class ForceImageDataset(Dataset):
         print("Metadata 스캐닝 중...")
         for obj_id in range(1, 51):
             obj_folder = self.root_dir / f"{obj_id:02d}"
+            csv_folder = CSV_DIR / f"{obj_id:02d}"
             if not obj_folder.exists(): continue
             for trial_id in range(1, 10):
-                csv_path = obj_folder / f"{trial_id}_frame_synced.csv"
+                csv_path = csv_folder / f"{trial_id}_frame_synced.csv"
                 img_dir = obj_folder / str(trial_id)
                 if not (csv_path.exists() and img_dir.exists()): continue
                 try:

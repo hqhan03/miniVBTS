@@ -19,8 +19,10 @@ import seaborn as sns
 from tqdm import tqdm
 
 # --- 1. 하드웨어 및 경로 설정 ---
-DATA_DIR = Path(r"C:\Users\hq\Downloads\20251202_Force_Estimation\20251224_miniVBTS_force_estimation_data")
-SAVE_DIR = Path(r"./research_results_1920x1080")
+DATA_DIR = Path(r"C:\Users\hq\Downloads\20251202_Force_Estimation\20260509_miniVBTS_force_estimation_data")
+CSV_DIR = DATA_DIR / "FTsensor_data"
+IMG_DIR = DATA_DIR / "Processed_img"
+SAVE_DIR = Path(r"./research_results_1632x1080")
 PLOT_DIR = SAVE_DIR / "plots"
 TS_DIR = SAVE_DIR / "timeseries_results" # 시계열 결과 저장 폴더
 
@@ -36,7 +38,7 @@ if not torch.cuda.is_available():
     raise RuntimeError("CUDA GPU를 찾을 수 없습니다. GPU 환경에서 실행해주세요.")
 DEVICE = torch.device("cuda")
 
-torch.backends.cudnn.benchmark = False
+torch.backends.cudnn.benchmark = True
 
 # --- 2. Dataset 및 전처리 ---
 train_transform = A.Compose([
@@ -52,8 +54,7 @@ val_transform = A.Compose([
 ])
 
 class ForceImageDataset(Dataset):
-    def __init__(self, root_dir, transform=None):
-        self.root_dir = Path(root_dir)
+    def __init__(self, transform=None):
         self.transform = transform
         self.samples = []
         self.sample_obj_ids = []
@@ -64,11 +65,12 @@ class ForceImageDataset(Dataset):
     def _load_metadata(self):
         print("Metadata 스캐닝 중...")
         for obj_id in range(1, 51):
-            obj_folder = self.root_dir / f"{obj_id:02d}"
-            if not obj_folder.exists(): continue
+            csv_folder = CSV_DIR / f"{obj_id:02d}"
+            img_folder = IMG_DIR / f"{obj_id:02d}"
+            if not img_folder.exists(): continue
             for trial_id in range(1, 10):
-                csv_path = obj_folder / f"{trial_id}_frame_synced.csv"
-                img_dir = obj_folder / str(trial_id)
+                csv_path = csv_folder / f"{trial_id}_frame_synced.csv"
+                img_dir = img_folder / str(trial_id)
                 if not (csv_path.exists() and img_dir.exists()): continue
                 try:
                     df = pd.read_csv(csv_path)
@@ -229,7 +231,7 @@ def main():
     start_time = time.time()
 
     # 데이터 로드 및 분할
-    full_dataset = ForceImageDataset(DATA_DIR)
+    full_dataset = ForceImageDataset()
     all_obj_ids = list(range(1, 51))
     random.seed(42)
     obj_test_ids = random.sample(all_obj_ids, 5) # 5개 물체를 아예 테스트용으로 격리
@@ -246,7 +248,7 @@ def main():
     full_dataset.set_scaler(scaler)
     joblib.dump(scaler, SAVE_DIR / "scaler.pkl")
 
-    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=torch.cuda.is_available())
+    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=BATCH_SIZE, shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
     val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     std_test_loader = DataLoader(Subset(full_dataset, std_test_idx), batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)
     obj_test_loader = DataLoader(Subset(full_dataset, obj_test_indices), batch_size=BATCH_SIZE, num_workers=NUM_WORKERS)

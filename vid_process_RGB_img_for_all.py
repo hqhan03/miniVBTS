@@ -8,15 +8,16 @@ import os
 # --- 1. 설정부 ---
 CROP_PERCENT_TOP = 0.0
 CROP_PERCENT_BOTTOM = 0.0
-CROP_PERCENT_LEFT = 0.0
-CROP_PERCENT_RIGHT = 0.0
+CROP_PERCENT_LEFT = 0.05
+CROP_PERCENT_RIGHT = 0.1
 
 GREEN_CONTRAST_FACTOR = 20.0
 RED_CONTRAST_FACTOR = 10.0
 GAUSSIAN_KERNEL_SIZE = (5, 5)
 
 # 경로 설정 
-data_root = Path(r"C:\Users\hq\Documents\20251202_Force_Estimation\data")
+data_root = Path(r"C:\Users\hq\Downloads\20251202_Force_Estimation\20251224_miniVBTS_force_estimation_data")
+save_root = Path(r"C:\Users\hq\Downloads\20251202_Force_Estimation\20260509_miniVBTS_force_estimation_data\processed_img")
 
 def process_single_video(args):
     """
@@ -95,16 +96,16 @@ if __name__ == "__main__":
     else:
         # 작업 리스트 생성
         task_list = []
-        subfolders = [f"{i:02d}" for i in range(26, 51)]
+        subfolders = [f"{i:02d}" for i in range(1, 26)]
         
         for folder_name in subfolders:
-            current_folder = data_root / folder_name
-            if not current_folder.exists(): continue
-            
+            video_folder = data_root / "Raw_video" / folder_name
+            if not video_folder.exists(): continue
+
             for v_idx in range(1, 10):
-                video_file = current_folder / f"{v_idx}.mp4"
+                video_file = video_folder / f"{v_idx}.mp4"
                 if video_file.exists():
-                    save_path = current_folder / video_file.stem
+                    save_path = save_root / folder_name / video_file.stem
                     task_list.append((video_file, save_path))
 
         # 멀티프로세싱 실행 (CPU 코어 수에 맞춰 자동 설정)

@@ -35,6 +35,7 @@ DenseNet161을 fine-tuning하여 이미지 -> 6축 Force/Torque 회귀 모델을
 |---|---|
 | `force_estimation.py` | 224x224 리사이즈 버전 (원본 해상도 무관) |
 | `force_estimation_1632x1080.py` | 1632x1080 원본 해상도 입력 버전 |
+| `resolution_study.py` | 해상도별 성능 비교 실험 (1632x1080 ~ 151x100) |
 
 **Model Details:**
 - Backbone: DenseNet161 (pretrained on ImageNet)
@@ -48,6 +49,37 @@ DenseNet161을 fine-tuning하여 이미지 -> 6축 Force/Torque 회귀 모델을
 - Parity plots (Actual vs Predicted)
 - Metrics: RMSE, MAE, R2, Bias, Slope, Intercept
 - Time-series analysis (10 random trials)
+
+### 4. Resolution Study
+입력 해상도가 Force/Torque 추정 정확도에 미치는 영향을 비교 분석합니다.
+
+**테스트 해상도 (원본 비율 3:2 유지):**
+
+| Label | Resolution | Pixels |
+|---|---|---|
+| 1080p | 1632x1080 | 1.76M |
+| 720p | 1088x720 | 783K |
+| 480p | 725x480 | 348K |
+| 360p | 544x360 | 196K |
+| 240p | 363x240 | 87K |
+| 100p | 151x100 | 15K |
+
+**2-GPU 분산 실행 지원:**
+```bash
+# 5090 (고해상도 3개)
+python resolution_study.py --part 1
+
+# 5070 Ti (저해상도 3개)
+python resolution_study.py --part 2
+
+# 양쪽 결과 병합 후 비교 그래프 생성 (GPU 불필요)
+python resolution_study.py --merge
+```
+
+**출력:**
+- 해상도별 R², RMSE, MAE 비교 그래프
+- 해상도별 Parity plots 및 Loss curves
+- 해상도-성능-학습시간 종합 Summary
 
 ## Requirements
 
@@ -65,6 +97,7 @@ DenseNet161을 fine-tuning하여 이미지 -> 6축 Force/Torque 회귀 모델을
 ```
 ├── force_estimation.py              # 224x224 모델 학습/평가
 ├── force_estimation_1632x1080.py    # 원본 해상도 모델 학습/평가
+├── resolution_study.py              # 해상도별 성능 비교 실험
 ├── vid_process_RGB.py               # 단일 영상 전처리 (RGB)
 ├── vid_process_RG                   # 단일 영상 전처리 (RG)
 ├── vid_process_RGB_img_for_all.py   # 일괄 영상 전처리

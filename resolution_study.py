@@ -142,8 +142,8 @@ def evaluate_model(model, loader, scaler):
             all_preds.append(preds.cpu().numpy())
             all_truth.append(labels.numpy())
 
-    y_pred = scaler.inverse_transform(np.vstack(all_preds))
-    y_true = scaler.inverse_transform(np.vstack(all_truth))
+    y_pred = scaler.inverse_transform(np.vstack(all_preds)).astype(np.float64)
+    y_true = scaler.inverse_transform(np.vstack(all_truth)).astype(np.float64)
 
     metrics = {}
     for i, col in enumerate(LABEL_COLUMNS):
@@ -225,8 +225,8 @@ def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_t
                 trial_preds.append(preds.cpu().numpy())
                 trial_labels.append(labels.numpy())
 
-        y_pred = scaler.inverse_transform(np.vstack(trial_preds))
-        y_true = scaler.inverse_transform(np.vstack(trial_labels))
+        y_pred = scaler.inverse_transform(np.vstack(trial_preds)).astype(np.float64)
+        y_true = scaler.inverse_transform(np.vstack(trial_labels)).astype(np.float64)
 
         # CSV 저장
         df_res = pd.DataFrame()

@@ -1,6 +1,7 @@
 """
-Resolution Study: 해상도별 Force Estimation 성능 비교
-1632x1080 원본에서 151x100까지 6단계 다운스케일 → 학습/평가 → 비교 그래프 생성
+Resolution Study v2: multi-seed + best-val checkpointing + grad clipping + inference latency
+- 기존 v1 결과는 seed=42로 옮긴 뒤 seed=[0, 1]만 추가 학습하면 됨
+- training time 비교는 폐기, inference latency로 대체
 """
 import cv2
 import pandas as pd
@@ -32,27 +33,48 @@ SAVE_DIR = Path(r"./resolution_study_results")
 SAVE_DIR.mkdir(exist_ok=True)
 
 LABEL_COLUMNS = ['Force X', 'Force Y', 'Force Z', 'Torque X', 'Torque Y', 'Torque Z']
-BATCH_SIZE = 4
+BATCH_SIZE = 16
 NUM_WORKERS = 4
 EPOCHS = 20
 LEARNING_RATE = 1e-4
+GRAD_CLIP_MAX_NORM = 1.0
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if torch.cuda.is_available():
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = True  # 결정성보다 속도 우선
 
-# 해상도 목록: (width, height) - 원본 비율(1632:1080 ≈ 3:2) 유지, 짧은 변 기준
 RESOLUTIONS = [
-    (1632, 1080),  # 원본
-    (1088, 720),   # 720p
-    (725, 480),    # 480p
-    (544, 360),    # 360p
-    (363, 240),    # 240p
-    (151, 100),    # 100p
+    (1632, 1080),
+    (1088, 720),
+    (725, 480),
+    (544, 360),
+    (363, 240),
+    (151, 100),
 ]
+SEEDS = [42, 0, 1]  # 기존 결과 = seed 42; 0, 1 추가로 돌리면 됨
 
 
-# --- Dataset (원본과 동일, 한 번만 로드) ---
+# ============================================================
+# Seed utilities
+# ============================================================
+def set_seed(seed: int):
+    """전역 RNG seed (cudnn.benchmark는 그대로 둠)"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def seed_worker(worker_id):
+    """DataLoader worker별 seeding"""
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
+
+
+# ============================================================
+# Dataset (v1과 동일)
+# ============================================================
 class ForceImageDataset(Dataset):
     def __init__(self, transform=None):
         self.transform = transform
@@ -112,9 +134,10 @@ class ForceImageDataset(Dataset):
         return image, torch.tensor(self.labels[label_idx])
 
 
-# --- Transform 생성 ---
+# ============================================================
+# Transforms
+# ============================================================
 def make_transforms(width, height):
-    """해상도별 train/val transform 생성 (Resize 포함)"""
     train_tf = A.Compose([
         A.Resize(height, width),
         A.HorizontalFlip(p=0.5),
@@ -130,7 +153,9 @@ def make_transforms(width, height):
     return train_tf, val_tf
 
 
-# --- 모델 평가 ---
+# ============================================================
+# Evaluation
+# ============================================================
 def evaluate_model(model, loader, scaler):
     model.eval()
     all_preds, all_truth = [], []
@@ -158,7 +183,42 @@ def evaluate_model(model, loader, scaler):
     return metrics, y_true, y_pred
 
 
-# --- Parity Plot 저장 ---
+# ============================================================
+# Inference latency 측정
+# ============================================================
+def measure_inference_latency(model, height, width, n_warmup=20, n_iter=100):
+    """CUDA Event 기반 single-image inference latency (ms)
+    배치=1, AMP on. 같은 GPU에서 모든 해상도를 측정해야 fair.
+    """
+    if not torch.cuda.is_available():
+        return None, None
+
+    model.eval()
+    dummy = torch.randn(1, 3, height, width, device=DEVICE)
+
+    with torch.no_grad():
+        for _ in range(n_warmup):
+            with torch.amp.autocast(DEVICE.type):
+                _ = model(dummy)
+    torch.cuda.synchronize()
+
+    starter = torch.cuda.Event(enable_timing=True)
+    ender = torch.cuda.Event(enable_timing=True)
+    times = []
+    with torch.no_grad():
+        for _ in range(n_iter):
+            starter.record()
+            with torch.amp.autocast(DEVICE.type):
+                _ = model(dummy)
+            ender.record()
+            torch.cuda.synchronize()
+            times.append(starter.elapsed_time(ender))
+    return float(np.median(times)), float(np.percentile(times, 90))
+
+
+# ============================================================
+# Parity / detailed metrics / time-series (v1과 동일)
+# ============================================================
 def save_parity_plots(y_true, y_pred, save_path, title_prefix):
     sns.set_theme(style="whitegrid")
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
@@ -169,21 +229,15 @@ def save_parity_plots(y_true, y_pred, save_path, title_prefix):
         lims = [min(y_true[:, i].min(), y_pred[:, i].min()),
                 max(y_true[:, i].max(), y_pred[:, i].max())]
         axes[i].plot(lims, lims, 'r--', linewidth=1.5)
-        axes[i].set_xlim(lims)
-        axes[i].set_ylim(lims)
-        axes[i].set_aspect('equal')
+        axes[i].set_xlim(lims); axes[i].set_ylim(lims); axes[i].set_aspect('equal')
         axes[i].set_title(col, fontsize=14)
-        axes[i].set_xlabel('Actual')
-        axes[i].set_ylabel('Predicted')
+        axes[i].set_xlabel('Actual'); axes[i].set_ylabel('Predicted')
         r2 = r2_score(y_true[:, i], y_pred[:, i])
         axes[i].text(0.05, 0.95, f'$R^2={r2:.3f}$', transform=axes[i].transAxes,
                      va='top', bbox=dict(boxstyle='round', fc='white', alpha=0.5))
-    plt.tight_layout()
-    plt.savefig(save_path, dpi=200)
-    plt.close()
+    plt.tight_layout(); plt.savefig(save_path, dpi=200); plt.close()
 
 
-# --- Detailed Metrics CSV 저장 ---
 def save_detailed_metrics(metrics, save_path):
     rows = []
     for col in LABEL_COLUMNS:
@@ -199,8 +253,7 @@ def save_detailed_metrics(metrics, save_path):
     pd.DataFrame(rows).to_csv(save_path, index=False)
 
 
-# --- 시계열 분석 및 저장 ---
-def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_trials=10):
+def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_trials=10, seed=42):
     print(f"  [Time-series] {num_trials}개 샘플 추출 중...")
     model.eval()
     ts_dir.mkdir(exist_ok=True)
@@ -209,12 +262,12 @@ def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_t
     test_pairs = sorted(list(set(
         [(dataset.sample_obj_ids[i], dataset.sample_trial_ids[i]) for i in test_indices]
     )))
-    selected_pairs = random.sample(test_pairs, min(num_trials, len(test_pairs)))
+    rng = random.Random(seed)  # seed별 다른 trial 뽑힘
+    selected_pairs = rng.sample(test_pairs, min(num_trials, len(test_pairs)))
 
     for obj_id, trial_id in selected_pairs:
         indices = [i for i, (o, t) in enumerate(zip(dataset.sample_obj_ids, dataset.sample_trial_ids))
                    if o == obj_id and t == trial_id]
-
         trial_preds, trial_labels = [], []
         trial_loader = DataLoader(Subset(dataset, indices), batch_size=BATCH_SIZE, shuffle=False)
         with torch.no_grad():
@@ -228,7 +281,6 @@ def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_t
         y_pred = scaler.inverse_transform(np.vstack(trial_preds)).astype(np.float64)
         y_true = scaler.inverse_transform(np.vstack(trial_labels)).astype(np.float64)
 
-        # CSV 저장
         df_res = pd.DataFrame()
         df_res['Frame'] = range(len(y_true))
         for i, col in enumerate(LABEL_COLUMNS):
@@ -236,7 +288,6 @@ def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_t
             df_res[f'Pred_{col}'] = y_pred[:, i]
         df_res.to_csv(ts_dir / f"Time-series_Obj{obj_id:02d}_Trial{trial_id}.csv", index=False)
 
-        # Plot
         fig, axes = plt.subplots(3, 2, figsize=(16, 12))
         fig.suptitle(f"Object {obj_id:02d} - Trial {trial_id}", fontsize=18)
         axes = axes.flatten()
@@ -244,37 +295,37 @@ def save_timeseries_analysis(model, dataset, obj_test_ids, scaler, ts_dir, num_t
             axes[i].plot(df_res['Frame'], df_res[f'True_{col}'], label='Ground Truth', color='black', alpha=0.6)
             axes[i].plot(df_res['Frame'], df_res[f'Pred_{col}'], label='Predicted', color='red', linestyle='--')
             axes[i].set_title(f"{col} Estimation", fontsize=14)
-            axes[i].set_xlabel("Frame Index")
-            axes[i].set_ylabel("Value")
-            axes[i].legend()
-            axes[i].grid(True, alpha=0.3)
+            axes[i].set_xlabel("Frame Index"); axes[i].set_ylabel("Value")
+            axes[i].legend(); axes[i].grid(True, alpha=0.3)
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.savefig(ts_dir / f"Plot_Obj{obj_id:02d}_Trial{trial_id}.png", dpi=200)
         plt.close()
 
-    print(f"  [Time-series] 완료: {ts_dir}")
 
-
-# --- 단일 해상도 학습 ---
-def train_one_resolution(width, height, full_dataset, train_idx, val_idx,
-                         std_test_idx, obj_test_indices, obj_test_ids, scaler):
+# ============================================================
+# Single (resolution, seed) 학습
+# ============================================================
+def train_one_run(width, height, seed, full_dataset, train_idx, val_idx,
+                  std_test_idx, obj_test_indices, obj_test_ids, scaler):
     label = f"{width}x{height}"
-    res_dir = SAVE_DIR / label
-    res_dir.mkdir(exist_ok=True)
+    run_dir = SAVE_DIR / label / f"seed_{seed}"
+    run_dir.mkdir(parents=True, exist_ok=True)
 
+    set_seed(seed)
     train_tf, val_tf = make_transforms(width, height)
 
-    # DataLoaders
-    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=BATCH_SIZE,
-                              shuffle=True, num_workers=NUM_WORKERS, pin_memory=True)
-    val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=BATCH_SIZE,
-                            num_workers=NUM_WORKERS)
-    std_test_loader = DataLoader(Subset(full_dataset, std_test_idx), batch_size=BATCH_SIZE,
-                                 num_workers=NUM_WORKERS)
-    obj_test_loader = DataLoader(Subset(full_dataset, obj_test_indices), batch_size=BATCH_SIZE,
-                                 num_workers=NUM_WORKERS)
+    g = torch.Generator(); g.manual_seed(seed)
 
-    # 매 해상도마다 fresh model
+    train_loader = DataLoader(Subset(full_dataset, train_idx), batch_size=BATCH_SIZE,
+                              shuffle=True, num_workers=NUM_WORKERS, pin_memory=True,
+                              worker_init_fn=seed_worker, generator=g)
+    val_loader = DataLoader(Subset(full_dataset, val_idx), batch_size=BATCH_SIZE,
+                            num_workers=NUM_WORKERS, worker_init_fn=seed_worker)
+    std_test_loader = DataLoader(Subset(full_dataset, std_test_idx), batch_size=BATCH_SIZE,
+                                 num_workers=NUM_WORKERS, worker_init_fn=seed_worker)
+    obj_test_loader = DataLoader(Subset(full_dataset, obj_test_indices), batch_size=BATCH_SIZE,
+                                 num_workers=NUM_WORKERS, worker_init_fn=seed_worker)
+
     model = models.densenet161(weights=models.DenseNet161_Weights.DEFAULT)
     model.classifier = nn.Linear(model.classifier.in_features, len(LABEL_COLUMNS))
     model = model.to(DEVICE)
@@ -284,28 +335,33 @@ def train_one_resolution(width, height, full_dataset, train_idx, val_idx,
     grad_scaler = torch.amp.GradScaler(DEVICE.type)
 
     train_losses, val_losses = [], []
+    best_val_loss = float('inf')
+    best_state = None
+    best_epoch = -1
 
     for epoch in range(EPOCHS):
         # --- Train ---
         model.train()
         full_dataset.transform = train_tf
         epoch_loss = 0
-        pbar = tqdm(train_loader, desc=f"[{label}] Epoch {epoch+1}/{EPOCHS}")
+        pbar = tqdm(train_loader, desc=f"[{label} seed={seed}] Epoch {epoch+1}/{EPOCHS}")
         for images, labels in pbar:
             images, labels = images.to(DEVICE), labels.to(DEVICE)
             optimizer.zero_grad(set_to_none=True)
             with torch.amp.autocast(DEVICE.type):
                 loss = criterion(model(images), labels)
             grad_scaler.scale(loss).backward()
+            # ★ clip 전 unscale (AMP 표준 순서)
+            grad_scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=GRAD_CLIP_MAX_NORM)
             grad_scaler.step(optimizer)
             grad_scaler.update()
             epoch_loss += loss.item()
             pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-
         avg_train = epoch_loss / len(train_loader)
         train_losses.append(avg_train)
 
-        # --- Validation ---
+        # --- Val ---
         model.eval()
         full_dataset.transform = val_tf
         val_loss = 0
@@ -317,48 +373,114 @@ def train_one_resolution(width, height, full_dataset, train_idx, val_idx,
         avg_val = val_loss / len(val_loader)
         val_losses.append(avg_val)
 
-        print(f"[{label}] Epoch {epoch+1}: Train={avg_train:.4f} Val={avg_val:.4f}")
+        # ★ best-val 갱신
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            best_epoch = epoch + 1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    # Loss history 저장
+        print(f"[{label} seed={seed}] Epoch {epoch+1}: Train={avg_train:.4f} Val={avg_val:.4f}"
+              f"{' ★ best' if best_epoch == epoch + 1 else ''}")
+
+    # Loss history
     pd.DataFrame({
         'epoch': range(1, EPOCHS + 1),
         'train_loss': train_losses,
         'val_loss': val_losses,
-    }).to_csv(res_dir / "loss_history.csv", index=False)
+    }).to_csv(run_dir / "loss_history.csv", index=False)
 
-    # 평가
+    # ★ best checkpoint로 복원 후 평가
+    model.load_state_dict(best_state)
     full_dataset.transform = val_tf
     std_metrics, std_true, std_pred = evaluate_model(model, std_test_loader, scaler)
     obj_metrics, obj_true, obj_pred = evaluate_model(model, obj_test_loader, scaler)
 
-    # Parity plots
-    save_parity_plots(std_true, std_pred, res_dir / "parity_standard_test.png",
-                      f"{label} - Standard Test")
-    save_parity_plots(obj_true, obj_pred, res_dir / "parity_object_test.png",
-                      f"{label} - Object-Based Test")
+    save_parity_plots(std_true, std_pred, run_dir / "parity_standard_test.png",
+                      f"{label} seed={seed} - Standard Test")
+    save_parity_plots(obj_true, obj_pred, run_dir / "parity_object_test.png",
+                      f"{label} seed={seed} - Object-Based Test")
+    save_detailed_metrics(std_metrics, run_dir / "Standard_Test_metrics.csv")
+    save_detailed_metrics(obj_metrics, run_dir / "Object_Based_Test_metrics.csv")
 
-    # Detailed metrics CSV (Bias, Slope, Intercept 포함)
-    save_detailed_metrics(std_metrics, res_dir / "Standard_Test_metrics.csv")
-    save_detailed_metrics(obj_metrics, res_dir / "Object_Based_Test_metrics.csv")
-
-    # 시계열 분석 (10 random trials)
     save_timeseries_analysis(model, full_dataset, obj_test_ids, scaler,
-                             ts_dir=res_dir / "timeseries_results")
+                             ts_dir=run_dir / "timeseries_results", seed=seed)
 
-    # 모델 저장
-    torch.save(model.state_dict(), res_dir / "model.pth")
+    # ★ inference latency 측정 (best checkpoint 기준)
+    lat_median, lat_p90 = measure_inference_latency(model, height, width)
 
-    del model
+    torch.save(best_state, run_dir / "model_best.pth")
+
+    result = {
+        'resolution': label, 'width': width, 'height': height,
+        'pixels': width * height, 'short_side': height,
+        'seed': seed,
+        'best_epoch': best_epoch,
+        'best_val_loss': best_val_loss,
+        'inference_latency_ms_median': lat_median,
+        'inference_latency_ms_p90': lat_p90,
+        'std_test': std_metrics,
+        'obj_test': obj_metrics,
+    }
+    with open(run_dir / "metrics.json", 'w') as f:
+        json.dump(result, f, indent=2, ensure_ascii=False)
+
+    del model, best_state
     torch.cuda.empty_cache()
+    return result
 
-    return std_metrics, obj_metrics
+
+# ============================================================
+# Aggregation across seeds
+# ============================================================
+def aggregate_seeds(resolution_label):
+    """한 resolution의 seed별 결과를 mean/std로 집계"""
+    res_dir = SAVE_DIR / resolution_label
+    seed_results = []
+    for seed in SEEDS:
+        f = res_dir / f"seed_{seed}" / "metrics.json"
+        if f.exists():
+            with open(f) as fp:
+                seed_results.append(json.load(fp))
+    if not seed_results:
+        return None
+
+    agg = {
+        'resolution': resolution_label,
+        'width': seed_results[0]['width'],
+        'height': seed_results[0]['height'],
+        'short_side': seed_results[0]['short_side'],
+        'pixels': seed_results[0]['pixels'],
+        'n_seeds': len(seed_results),
+        'seeds': [r['seed'] for r in seed_results],
+    }
+
+    # Inference latency (seed별 거의 동일하지만 평균)
+    lats = [r['inference_latency_ms_median'] for r in seed_results if r.get('inference_latency_ms_median')]
+    if lats:
+        agg['inference_latency_ms_mean'] = float(np.mean(lats))
+        agg['inference_latency_ms_std'] = float(np.std(lats))
+
+    # 모든 metric에 mean/std 계산
+    for test_key in ['std_test', 'obj_test']:
+        agg[test_key] = {}
+        for col in LABEL_COLUMNS:
+            for metric in ['R2', 'RMSE', 'MAE', 'Bias']:
+                key = f'{col}_{metric}'
+                vals = [r[test_key][key] for r in seed_results]
+                agg[test_key][f'{key}_mean'] = float(np.mean(vals))
+                agg[test_key][f'{key}_std'] = float(np.std(vals))
+
+    with open(res_dir / "aggregated.json", 'w') as f:
+        json.dump(agg, f, indent=2, ensure_ascii=False)
+    return agg
 
 
-# --- 비교 그래프 생성 ---
-def plot_resolution_comparison(results):
+# ============================================================
+# 비교 그래프 (mean ± std error bar)
+# ============================================================
+def plot_resolution_comparison(agg_results):
     sns.set_theme(style="whitegrid")
-    results = sorted(results, key=lambda x: x['short_side'])
-
+    results = sorted(agg_results, key=lambda x: x['short_side'])
     short_sides = [r['short_side'] for r in results]
     res_labels = [r['resolution'] for r in results]
 
@@ -367,180 +489,179 @@ def plot_resolution_comparison(results):
     colors_f = ['#e41a1c', '#377eb8', '#4daf4a']
     colors_t = ['#ff7f00', '#984ea3', '#a65628']
 
-    # ── 1. R² vs Resolution (Standard / Object 각각) ──
+    # 1. R² vs Resolution (error bars)
     for test_name, test_key in [("Standard Test", "std_test"), ("Object-Based Test", "obj_test")]:
         fig, ax = plt.subplots(figsize=(10, 6))
-
         for col, c in zip(force_cols, colors_f):
-            vals = [r[test_key][f'{col}_R2'] for r in results]
-            ax.plot(short_sides, vals, 'o-', label=col, color=c, lw=2, ms=8)
+            means = [r[test_key][f'{col}_R2_mean'] for r in results]
+            stds = [r[test_key][f'{col}_R2_std'] for r in results]
+            ax.errorbar(short_sides, means, yerr=stds, fmt='o-', label=col, color=c,
+                        lw=2, ms=8, capsize=4)
         for col, c in zip(torque_cols, colors_t):
-            vals = [r[test_key][f'{col}_R2'] for r in results]
-            ax.plot(short_sides, vals, 's--', label=col, color=c, lw=2, ms=8)
-
-        # Mean R²
-        mean_r2 = [np.mean([r[test_key][f'{col}_R2'] for col in LABEL_COLUMNS]) for r in results]
+            means = [r[test_key][f'{col}_R2_mean'] for r in results]
+            stds = [r[test_key][f'{col}_R2_std'] for r in results]
+            ax.errorbar(short_sides, means, yerr=stds, fmt='s--', label=col, color=c,
+                        lw=2, ms=8, capsize=4)
+        mean_r2 = [np.mean([r[test_key][f'{c}_R2_mean'] for c in LABEL_COLUMNS]) for r in results]
         ax.plot(short_sides, mean_r2, 'D-', label='Mean', color='black', lw=3, ms=10)
-
         ax.set_xlabel('Short Side Resolution (px)', fontsize=13)
         ax.set_ylabel('R²', fontsize=13)
-        ax.set_title(f'R² vs Resolution ({test_name})', fontsize=15)
+        ax.set_title(f'R² vs Resolution ({test_name}, mean ± std, n={results[0]["n_seeds"]})', fontsize=15)
         ax.set_xticks(short_sides)
         ax.set_xticklabels(res_labels, rotation=45, ha='right')
         ax.legend(loc='lower right', fontsize=10)
-        ax.set_ylim(bottom=min(0, min(mean_r2) - 0.1))
         plt.tight_layout()
         plt.savefig(SAVE_DIR / f"R2_vs_resolution_{test_key}.png", dpi=300)
         plt.close()
 
-    # ── 2. RMSE vs Resolution (Force / Torque 분리) ──
+    # 2. RMSE vs Resolution
     for test_name, test_key in [("Standard Test", "std_test"), ("Object-Based Test", "obj_test")]:
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
-
         for col, c in zip(force_cols, colors_f):
-            vals = [r[test_key][f'{col}_RMSE'] for r in results]
-            axes[0].plot(short_sides, vals, 'o-', label=col, color=c, lw=2, ms=8)
+            means = [r[test_key][f'{col}_RMSE_mean'] for r in results]
+            stds = [r[test_key][f'{col}_RMSE_std'] for r in results]
+            axes[0].errorbar(short_sides, means, yerr=stds, fmt='o-', label=col, color=c,
+                             lw=2, ms=8, capsize=4)
         axes[0].set_title(f'Force RMSE ({test_name})', fontsize=14)
-        axes[0].set_xlabel('Short Side (px)')
-        axes[0].set_ylabel('RMSE (N)')
+        axes[0].set_xlabel('Short Side (px)'); axes[0].set_ylabel('RMSE (N)')
         axes[0].set_xticks(short_sides)
         axes[0].set_xticklabels(res_labels, rotation=45, ha='right')
         axes[0].legend()
 
         for col, c in zip(torque_cols, colors_t):
-            vals = [r[test_key][f'{col}_RMSE'] for r in results]
-            axes[1].plot(short_sides, vals, 's-', label=col, color=c, lw=2, ms=8)
+            means = [r[test_key][f'{col}_RMSE_mean'] for r in results]
+            stds = [r[test_key][f'{col}_RMSE_std'] for r in results]
+            axes[1].errorbar(short_sides, means, yerr=stds, fmt='s-', label=col, color=c,
+                             lw=2, ms=8, capsize=4)
         axes[1].set_title(f'Torque RMSE ({test_name})', fontsize=14)
-        axes[1].set_xlabel('Short Side (px)')
-        axes[1].set_ylabel('RMSE (N·m)')
+        axes[1].set_xlabel('Short Side (px)'); axes[1].set_ylabel('RMSE (N·m)')
         axes[1].set_xticks(short_sides)
         axes[1].set_xticklabels(res_labels, rotation=45, ha='right')
         axes[1].legend()
-
         plt.tight_layout()
         plt.savefig(SAVE_DIR / f"RMSE_vs_resolution_{test_key}.png", dpi=300)
         plt.close()
 
-    # ── 3. Summary: Mean R² + Training Time ──
+    # 3. Summary: Mean R² + Inference Latency
     fig, ax1 = plt.subplots(figsize=(10, 6))
+    std_means = []
+    std_stds = []
+    obj_means = []
+    obj_stds = []
+    for r in results:
+        std_per = [r['std_test'][f'{c}_R2_mean'] for c in LABEL_COLUMNS]
+        obj_per = [r['obj_test'][f'{c}_R2_mean'] for c in LABEL_COLUMNS]
+        std_means.append(np.mean(std_per))
+        obj_means.append(np.mean(obj_per))
+        # 6-axis 평균값의 seed간 std는 별도 계산이 필요하지만 근사로 평균 std 사용
+        std_stds.append(np.mean([r['std_test'][f'{c}_R2_std'] for c in LABEL_COLUMNS]))
+        obj_stds.append(np.mean([r['obj_test'][f'{c}_R2_std'] for c in LABEL_COLUMNS]))
 
-    mean_r2_std = [np.mean([r['std_test'][f'{c}_R2'] for c in LABEL_COLUMNS]) for r in results]
-    mean_r2_obj = [np.mean([r['obj_test'][f'{c}_R2'] for c in LABEL_COLUMNS]) for r in results]
-    times_min = [r['elapsed_seconds'] / 60 for r in results]
-
-    ax1.plot(short_sides, mean_r2_std, 'o-', color='#2196F3', lw=2.5, ms=10, label='Standard Test R²')
-    ax1.plot(short_sides, mean_r2_obj, 's-', color='#F44336', lw=2.5, ms=10, label='Object Test R²')
+    ax1.errorbar(short_sides, std_means, yerr=std_stds, fmt='o-', color='#2196F3',
+                 lw=2.5, ms=10, capsize=5, label='Standard Test R²')
+    ax1.errorbar(short_sides, obj_means, yerr=obj_stds, fmt='s-', color='#F44336',
+                 lw=2.5, ms=10, capsize=5, label='Object Test R²')
     ax1.set_xlabel('Short Side Resolution (px)', fontsize=13)
     ax1.set_ylabel('Mean R²', fontsize=13)
     ax1.set_xticks(short_sides)
     ax1.set_xticklabels(res_labels, rotation=45, ha='right')
     ax1.legend(loc='center left', fontsize=11)
 
-    ax2 = ax1.twinx()
-    bar_width = max(15, min(50, (short_sides[-1] - short_sides[0]) / len(short_sides) * 0.3))
-    ax2.bar(short_sides, times_min, width=bar_width, alpha=0.2, color='gray', label='Training Time')
-    ax2.set_ylabel('Training Time (min)', fontsize=13, color='gray')
-    ax2.legend(loc='center right', fontsize=11)
+    # Inference latency (ms) bar
+    lats = [r.get('inference_latency_ms_mean', 0) for r in results]
+    if any(lats):
+        ax2 = ax1.twinx()
+        bar_width = max(15, min(50, (short_sides[-1] - short_sides[0]) / len(short_sides) * 0.3))
+        ax2.bar(short_sides, lats, width=bar_width, alpha=0.2, color='gray', label='Inference Latency')
+        ax2.set_ylabel('Inference Latency (ms, batch=1)', fontsize=13, color='gray')
+        ax2.legend(loc='center right', fontsize=11)
 
-    ax1.set_title('Resolution vs Performance & Training Time', fontsize=15)
+    ax1.set_title('Resolution vs Performance & Inference Latency', fontsize=15)
     plt.tight_layout()
-    plt.savefig(SAVE_DIR / "summary_r2_and_time.png", dpi=300)
+    plt.savefig(SAVE_DIR / "summary_r2_and_latency.png", dpi=300)
     plt.close()
 
-    # ── 4. Loss Curves 비교 ──
+    # 4. Loss curves (seed=42만, 비교용)
     fig, axes = plt.subplots(1, 2, figsize=(14, 5))
     for r in results:
-        loss_df = pd.read_csv(SAVE_DIR / r['resolution'] / "loss_history.csv")
+        loss_f = SAVE_DIR / r['resolution'] / "seed_42" / "loss_history.csv"
+        if not loss_f.exists():
+            continue
+        loss_df = pd.read_csv(loss_f)
         axes[0].plot(loss_df['epoch'], loss_df['train_loss'], label=r['resolution'])
         axes[1].plot(loss_df['epoch'], loss_df['val_loss'], label=r['resolution'])
-
-    for ax, title in zip(axes, ['Training Loss', 'Validation Loss']):
+    for ax, title in zip(axes, ['Training Loss (seed=42)', 'Validation Loss (seed=42)']):
         ax.set_title(title, fontsize=14)
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel('MSE Loss')
-        ax.legend(fontsize=9)
-        ax.set_yscale('log')
-
+        ax.set_xlabel('Epoch'); ax.set_ylabel('MSE Loss')
+        ax.legend(fontsize=9); ax.set_yscale('log')
     plt.tight_layout()
     plt.savefig(SAVE_DIR / "loss_curves_comparison.png", dpi=300)
     plt.close()
 
-    print(f"\n비교 그래프 저장 완료: {SAVE_DIR.absolute()}")
 
-
-# --- Main ---
-def load_all_results():
-    """저장된 metrics.json 파일들을 모두 로드"""
-    results = []
-    for w, h in RESOLUTIONS:
-        label = f"{w}x{h}"
-        result_file = SAVE_DIR / label / "metrics.json"
-        if result_file.exists():
-            with open(result_file) as f:
-                results.append(json.load(f))
-        else:
-            print(f"  [WARNING] {label} 결과 없음 → 건너뜀")
-    return results
-
-
+# ============================================================
+# Main
+# ============================================================
 def main():
-    parser = argparse.ArgumentParser(description="Resolution Study for Force Estimation")
-    parser.add_argument('--part', type=int, choices=[1, 2],
-                        help="1=고해상도 3개(5090용), 2=저해상도 3개(5070Ti용)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--seeds', type=int, nargs='+', default=None,
+                        help="실행할 seed들 (e.g., --seeds 0 1). 기본은 SEEDS 전체.")
+    parser.add_argument('--resolutions', type=str, nargs='+', default=None,
+                        help="실행할 해상도 (e.g., --resolutions 1632x1080). 기본은 전체.")
     parser.add_argument('--merge', action='store_true',
-                        help="양쪽 결과 병합 후 비교 그래프만 생성 (GPU 불필요)")
+                        help="기존 결과만 aggregate + plot")
     args = parser.parse_args()
 
-    # --merge 모드: 기존 결과만 로드하여 비교 그래프 생성
-    if args.merge:
-        print("결과 병합 및 비교 그래프 생성 모드")
-        results = load_all_results()
-        if len(results) < 2:
-            print("비교할 결과가 2개 이상 필요합니다.")
-            return
-        summary_rows = []
-        for r in results:
-            row = {'Resolution': r['resolution'], 'Pixels': r['pixels'],
-                   'Time(min)': round(r['elapsed_seconds'] / 60, 1)}
-            for test_key, prefix in [('std_test', 'Std'), ('obj_test', 'Obj')]:
-                for col in LABEL_COLUMNS:
-                    row[f'{prefix}_{col}_R2'] = round(r[test_key][f'{col}_R2'], 4)
-                    row[f'{prefix}_{col}_RMSE'] = round(r[test_key][f'{col}_RMSE'], 4)
-            summary_rows.append(row)
-        pd.DataFrame(summary_rows).to_csv(SAVE_DIR / "summary.csv", index=False)
-        plot_resolution_comparison(results)
-        print(f"결과 저장: {SAVE_DIR.absolute()}")
-        return
-
-    # GPU 확인 (학습 모드)
-    if not torch.cuda.is_available():
-        raise RuntimeError("CUDA GPU를 찾을 수 없습니다. (--merge는 GPU 없이 사용 가능)")
-
-    # Part 분할
-    if args.part == 1:
-        resolutions = RESOLUTIONS[:3]
-        print("Part 1 (5090): 1632x1080, 1088x720, 725x480")
-    elif args.part == 2:
-        resolutions = RESOLUTIONS[3:]
-        print("Part 2 (5070 Ti): 544x360, 363x240, 151x100")
+    seeds = args.seeds if args.seeds is not None else SEEDS
+    if args.resolutions is not None:
+        resolutions = [(int(s.split('x')[0]), int(s.split('x')[1])) for s in args.resolutions]
     else:
         resolutions = RESOLUTIONS
-        print(f"전체 {len(RESOLUTIONS)}개 해상도 실행")
 
-    total_start = time.time()
+    # --merge: aggregate만
+    if args.merge:
+        agg_results = []
+        for w, h in RESOLUTIONS:
+            label = f"{w}x{h}"
+            agg = aggregate_seeds(label)
+            if agg is not None:
+                agg_results.append(agg)
 
-    # 1. 데이터셋 로드 (1회)
+        # Summary CSV
+        summary_rows = []
+        for r in agg_results:
+            row = {
+                'Resolution': r['resolution'],
+                'Pixels': r['pixels'],
+                'N_seeds': r['n_seeds'],
+                'Latency_ms': round(r.get('inference_latency_ms_mean', 0), 3),
+            }
+            for test_key, prefix in [('std_test', 'Std'), ('obj_test', 'Obj')]:
+                for col in LABEL_COLUMNS:
+                    row[f'{prefix}_{col}_R2_mean'] = round(r[test_key][f'{col}_R2_mean'], 4)
+                    row[f'{prefix}_{col}_R2_std'] = round(r[test_key][f'{col}_R2_std'], 4)
+                    row[f'{prefix}_{col}_RMSE_mean'] = round(r[test_key][f'{col}_RMSE_mean'], 4)
+                    row[f'{prefix}_{col}_RMSE_std'] = round(r[test_key][f'{col}_RMSE_std'], 4)
+            summary_rows.append(row)
+        pd.DataFrame(summary_rows).to_csv(SAVE_DIR / "summary_aggregated.csv", index=False)
+
+        plot_resolution_comparison(agg_results)
+        print(f"Aggregation 완료: {SAVE_DIR.absolute()}")
+        return
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("CUDA GPU 필요 (--merge는 GPU 없이 가능)")
+
+    # 데이터셋 + split (seed 무관)
     full_dataset = ForceImageDataset()
 
-    # 2. 데이터 분할 (원본과 동일한 seed/방식)
     all_obj_ids = list(range(1, 51))
-    random.seed(42)
+    random.seed(42)  # split은 항상 동일하게 (seed 변경의 영향을 model init/training에만 한정)
     obj_test_ids = random.sample(all_obj_ids, 5)
     remaining = [i for i in all_obj_ids if i not in obj_test_ids]
 
     obj_test_indices = [i for i, o in enumerate(full_dataset.sample_obj_ids) if o in obj_test_ids]
     pool_indices = [i for i, o in enumerate(full_dataset.sample_obj_ids) if o in remaining]
-
     train_idx, temp_idx = train_test_split(pool_indices, test_size=0.4, random_state=42)
     val_idx, std_test_idx = train_test_split(temp_idx, test_size=0.5, random_state=42)
 
@@ -549,79 +670,32 @@ def main():
     full_dataset.set_scaler(scaler)
     joblib.dump(scaler, SAVE_DIR / "scaler.pkl")
 
-    # 3. 해상도별 학습 루프
-    results = []
-
-    for i, (w, h) in enumerate(resolutions):
+    # 학습 루프 (resolution × seed)
+    total_start = time.time()
+    for w, h in resolutions:
         label = f"{w}x{h}"
-        result_file = SAVE_DIR / label / "metrics.json"
+        for seed in seeds:
+            result_file = SAVE_DIR / label / f"seed_{seed}" / "metrics.json"
+            if result_file.exists():
+                print(f"[{label} seed={seed}] 이미 완료 → skip")
+                continue
+            print(f"\n{'='*60}\n [{label} seed={seed}]\n{'='*60}")
+            run_start = time.time()
+            train_one_run(w, h, seed, full_dataset, train_idx, val_idx,
+                          std_test_idx, obj_test_indices, obj_test_ids, scaler)
+            print(f"[{label} seed={seed}] 완료 ({(time.time()-run_start)/60:.1f}분)")
 
-        # 이미 완료된 해상도는 건너뜀 (이어하기 지원)
-        if result_file.exists():
-            print(f"\n[{label}] 이미 완료됨 → 결과 로드")
-            with open(result_file) as f:
-                results.append(json.load(f))
-            continue
+    # Aggregate + plot
+    agg_results = []
+    for w, h in RESOLUTIONS:
+        agg = aggregate_seeds(f"{w}x{h}")
+        if agg is not None:
+            agg_results.append(agg)
+    plot_resolution_comparison(agg_results)
 
-        print(f"\n{'='*60}")
-        print(f" [{i+1}/{len(resolutions)}] Resolution: {label}")
-        print(f"{'='*60}")
-
-        res_start = time.time()
-        std_m, obj_m = train_one_resolution(
-            w, h, full_dataset, train_idx, val_idx, std_test_idx, obj_test_indices, obj_test_ids, scaler
-        )
-        elapsed = time.time() - res_start
-
-        # execution_time.csv 저장
-        h_e, rem = divmod(int(elapsed), 3600)
-        m_e, s_e = divmod(rem, 60)
-        pd.DataFrame([{
-            "Total_Elapsed_Seconds": round(elapsed, 1),
-            "Total_Elapsed": f"{h_e}h {m_e}m {s_e}s",
-        }]).to_csv(SAVE_DIR / label / "execution_time.csv", index=False)
-
-        entry = {
-            'resolution': label,
-            'width': w,
-            'height': h,
-            'pixels': w * h,
-            'short_side': h,
-            'elapsed_seconds': round(elapsed, 1),
-            'std_test': std_m,
-            'obj_test': obj_m,
-        }
-
-        (SAVE_DIR / label).mkdir(exist_ok=True)
-        with open(result_file, 'w') as f:
-            json.dump(entry, f, indent=2, ensure_ascii=False)
-
-        results.append(entry)
-        print(f"[{label}] 완료! (소요: {elapsed/60:.1f}분)")
-
-    # 4. Summary CSV
-    summary_rows = []
-    for r in results:
-        row = {
-            'Resolution': r['resolution'],
-            'Pixels': r['pixels'],
-            'Time(min)': round(r['elapsed_seconds'] / 60, 1),
-        }
-        for test_key, prefix in [('std_test', 'Std'), ('obj_test', 'Obj')]:
-            for col in LABEL_COLUMNS:
-                row[f'{prefix}_{col}_R2'] = round(r[test_key][f'{col}_R2'], 4)
-                row[f'{prefix}_{col}_RMSE'] = round(r[test_key][f'{col}_RMSE'], 4)
-        summary_rows.append(row)
-    pd.DataFrame(summary_rows).to_csv(SAVE_DIR / "summary.csv", index=False)
-
-    # 5. 비교 그래프 생성
-    plot_resolution_comparison(results)
-
-    total_elapsed = time.time() - total_start
-    h_t, remainder = divmod(int(total_elapsed), 3600)
-    m_t, s_t = divmod(remainder, 60)
+    h_t, rem = divmod(int(time.time() - total_start), 3600)
+    m_t, s_t = divmod(rem, 60)
     print(f"\n총 실행 시간: {h_t}h {m_t}m {s_t}s")
-    print(f"결과 저장 위치: {SAVE_DIR.absolute()}")
 
 
 if __name__ == "__main__":
